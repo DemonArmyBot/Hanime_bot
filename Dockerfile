@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 # Install ffmpeg for yt-dlp
-RUN apt-get update && apt install git && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt install git -y && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
