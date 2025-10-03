@@ -12,6 +12,5 @@ Pillow
 psutil
 pycryptodomex
 aiofiles
-tgcrypto
 playwright
 git+https://github.com/cynthia2006/hanime-tv-plugin.git
