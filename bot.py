@@ -16,6 +16,21 @@ import json
 from tenacity import retry, stop_after_attempt, wait_exponential
 import aiofiles
 import psutil
+import sys
+
+# Try to import hanime plugin
+try:
+    # Add the plugin path if it exists
+    plugin_path = Path("/tmp/hanime-tv-plugin")
+    if plugin_path.exists() and str(plugin_path) not in sys.path:
+        sys.path.insert(0, str(plugin_path))
+    
+    from yt_dlp_plugins import hanime_tv
+    HANIME_PLUGIN_AVAILABLE = True
+    print("✅ Hanime TV plugin loaded successfully")
+except ImportError as e:
+    print(f"❌ Hanime TV plugin not available: {e}")
+    HANIME_PLUGIN_AVAILABLE = False
 
 # ---------------- Config from Environment ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -43,217 +58,129 @@ def get_download_dir() -> Path:
     tmp.mkdir(parents=True, exist_ok=True)
     return tmp
 
-class HanimeExtractor:
+class HanimeDownloader:
     def __init__(self):
-        self.session = cloudscraper.create_scraper()
-        self.session.headers.update({
+        self.scraper = cloudscraper.create_scraper()
+        self.scraper.headers.update({
             'User-Agent': USER_AGENT,
             'Referer': REFERER,
             'Origin': ORIGIN,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
         })
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    def get_random_video_url(self):
-        """Get a random video URL from hanime.tv"""
+    def get_random_video_page(self):
+        """Get a random video page URL"""
         try:
-            response = self.session.get("https://hanime.tv/browse/random", timeout=30)
+            response = self.scraper.get(
+                "https://hanime.tv/browse/random", 
+                allow_redirects=True, 
+                timeout=30
+            )
             response.raise_for_status()
             return response.url
         except Exception as e:
             logger.error(f"Failed to get random video: {e}")
             raise
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    def extract_video_data(self, video_url):
-        """Extract video data from hanime.tv page"""
-        try:
-            response = self.session.get(video_url, timeout=30)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Extract title
-            title = soup.find('title')
-            title_text = title.text.strip() if title else "Unknown Title"
-            
-            # Look for video data in various places
-            video_data = {
-                'title': title_text,
-                'url': video_url,
-                'video_urls': []
-            }
-            
-            # Method 1: Look for iframe embeds
-            iframes = soup.find_all('iframe', {'src': True})
-            for iframe in iframes:
-                if 'hanime.tv' in iframe['src'] or 'player' in iframe['src']:
-                    video_data['video_urls'].append(iframe['src'])
-            
-            # Method 2: Look for video tags
-            video_tags = soup.find_all('video', {'src': True})
-            for video in video_tags:
-                video_data['video_urls'].append(video['src'])
-            
-            # Method 3: Look for source tags inside video
-            sources = soup.find_all('source', {'src': True})
-            for source in sources:
-                video_data['video_urls'].append(source['src'])
-            
-            # Method 4: Look for m3u8 in script tags
-            scripts = soup.find_all('script')
-            for script in scripts:
-                if script.string:
-                    # Look for m3u8 URLs
-                    m3u8_patterns = [
-                        r'https?://[^\s"\']+\.m3u8[^\s"\']*',
-                        r'["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
-                        r'source\s*:\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
-                    ]
-                    
-                    for pattern in m3u8_patterns:
-                        matches = re.findall(pattern, script.string, re.IGNORECASE)
-                        for match in matches:
-                            if '.m3u8' in match:
-                                video_data['video_urls'].append(match)
-            
-            # Method 5: Look for JSON data with video info
-            for script in scripts:
-                if script.string and 'video' in script.string.lower():
-                    try:
-                        # Look for JSON objects
-                        json_patterns = [
-                            r'\{[^{}]*"url"[^{}]*\.m3u8[^{}]*\}',
-                            r'\{[^{}]*"sources"[^{}]*\}',
-                            r'\{[^{}]*"video"[^{}]*\}',
-                        ]
-                        
-                        for pattern in json_patterns:
-                            matches = re.findall(pattern, script.string)
-                            for match in matches:
-                                try:
-                                    data = json.loads(match)
-                                    self._extract_from_json(data, video_data)
-                                except:
-                                    continue
-                    except:
-                        continue
-            
-            # Method 6: Look for API endpoints
-            api_patterns = [
-                r'https?://[^\s"\']+\.json[^\s"\']*',
-                r'https?://[^\s"\']+/api/[^\s"\']*',
-            ]
-            
-            for script in scripts:
-                if script.string:
-                    for pattern in api_patterns:
-                        matches = re.findall(pattern, script.string)
-                        for match in matches:
-                            if 'hanime' in match or 'video' in match:
-                                video_data['video_urls'].append(match)
-            
-            return video_data
-            
-        except Exception as e:
-            logger.error(f"Failed to extract video data: {e}")
-            raise
-
-    def _extract_from_json(self, data, video_data):
-        """Recursively extract video URLs from JSON data"""
-        if isinstance(data, dict):
-            for key, value in data.items():
-                if isinstance(value, str) and ('.m3u8' in value or '.mp4' in value):
-                    video_data['video_urls'].append(value)
-                elif isinstance(value, (dict, list)):
-                    self._extract_from_json(value, video_data)
-        elif isinstance(data, list):
-            for item in data:
-                self._extract_from_json(item, video_data)
-
-    def get_best_video_url(self, video_data):
-        """Get the best video URL from extracted data"""
-        if not video_data['video_urls']:
-            return video_data['url']  # Fallback to original URL
+    def get_video_info(self, url):
+        """Get video information using yt-dlp with hanime plugin"""
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': False,
+            'extract_flat': False,
+            'force_json': True,
+        }
         
-        # Prioritize m3u8 URLs
-        m3u8_urls = [url for url in video_data['video_urls'] if '.m3u8' in url]
-        if m3u8_urls:
-            return m3u8_urls[0]
-        
-        # Then mp4 URLs
-        mp4_urls = [url for url in video_data['video_urls'] if '.mp4' in url]
-        if mp4_urls:
-            return mp4_urls[0]
-        
-        # Return the first URL found
-        return video_data['video_urls'][0]
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                info = ydl.extract_info(url, download=False)
+                return info
+            except Exception as e:
+                logger.error(f"yt-dlp info extraction failed: {e}")
+                raise
 
-def yt_dlp_download_blocking(url: str, outdir: Path, progress_state: dict) -> Path:
-    ydl_opts = {
-        "format": "best[ext=mp4]/best",
-        "outtmpl": str(outdir / "%(title).200s.%(ext)s"),
-        "http_chunk_size": 10 * 1024 * 1024,
-        "noplaylist": True,
-        "quiet": False,
-        "no_warnings": False,
-        "hls_use_mpegts": True,
-        "merge_output_format": "mp4",
-        "http_headers": {
-            "User-Agent": USER_AGENT,
-            "Referer": REFERER,
-            "Origin": ORIGIN,
-        },
-        "extractor_args": {
-            "generic": {
-                "skip_download": False
+    def download_video(self, url, outdir: Path, progress_state: dict) -> Path:
+        """Download video using yt-dlp with hanime plugin support"""
+        ydl_opts = {
+            "format": "best[ext=mp4]/best",
+            "outtmpl": str(outdir / "%(title).200s.%(ext)s"),
+            "http_chunk_size": 10 * 1024 * 1024,
+            "noplaylist": True,
+            "quiet": False,
+            "no_warnings": False,
+            "hls_use_mpegts": True,
+            "merge_output_format": "mp4",
+            "http_headers": {
+                "User-Agent": USER_AGENT,
+                "Referer": REFERER,
+                "Origin": ORIGIN,
+            },
+            # Hanime.tv specific options
+            "extractor_args": {
+                "hanimetv": {
+                    "skip_download": False
+                }
             }
         }
-    }
 
-    def progress_hook(d):
-        if d.get("status") == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            downloaded = d.get("downloaded_bytes", 0)
-            if total and total > 0:
-                progress_state["percent"] = min(100, int(downloaded * 100 / total))
-                progress_state["downloaded_mb"] = downloaded / 1024 / 1024
-                progress_state["total_mb"] = total / 1024 / 1024
-                progress_state["speed"] = d.get('speed', 0)
-        elif d.get("status") == "finished":
-            progress_state["percent"] = 100
-            progress_state["downloaded_mb"] = progress_state.get("total_mb", 0)
+        def progress_hook(d):
+            if d.get("status") == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                downloaded = d.get("downloaded_bytes", 0)
+                if total and total > 0:
+                    progress_state["percent"] = min(100, int(downloaded * 100 / total))
+                    progress_state["downloaded_mb"] = downloaded / 1024 / 1024
+                    progress_state["total_mb"] = total / 1024 / 1024
+                    progress_state["speed"] = d.get('speed', 0)
+                    progress_state["eta"] = d.get('eta', 0)
+            elif d.get("status") == "finished":
+                progress_state["percent"] = 100
+                progress_state["downloaded_mb"] = progress_state.get("total_mb", 0)
 
-    ydl_opts["progress_hooks"] = [progress_hook]
+        ydl_opts["progress_hooks"] = [progress_hook]
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            # First try to get info without downloading
-            info = ydl.extract_info(url, download=False)
-            logger.info(f"Video info: {info.get('title', 'Unknown')}")
-            
-            # Now download
-            ydl.download([url])
-            path = Path(ydl.prepare_filename(info))
-            
-            if not path.exists():
-                # Try different extensions
-                for ext in ['.mp4', '.mkv', '.webm', '.m4a']:
-                    test_path = path.with_suffix(ext)
-                    if test_path.exists():
-                        path = test_path
-                        break
-            
-            return path
-            
-        except Exception as e:
-            logger.error(f"yt-dlp extraction failed: {e}")
-            raise
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                # Extract info first
+                info = ydl.extract_info(url, download=False)
+                logger.info(f"🎯 Video found: {info.get('title', 'Unknown')}")
+                logger.info(f"📺 Duration: {info.get('duration', 'Unknown')}s")
+                logger.info(f"🎞️ Formats: {len(info.get('formats', []))}")
+                
+                # Download the video
+                ydl.download([url])
+                
+                # Get the downloaded file path
+                path = Path(ydl.prepare_filename(info))
+                
+                # Handle different file extensions
+                if not path.exists():
+                    for ext in ['.mp4', '.mkv', '.webm', '.m4a', '.ts']:
+                        test_path = path.with_suffix(ext)
+                        if test_path.exists():
+                            path = test_path
+                            break
+                
+                if not path.exists():
+                    # Try to find any recently created video files
+                    download_files = list(outdir.glob("*"))
+                    if download_files:
+                        # Get the most recently modified file
+                        download_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                        path = download_files[0]
+                
+                return path
+                
+            except Exception as e:
+                logger.error(f"Download failed: {e}")
+                raise
 
 async def send_large_file(context, chat_id, file_path, status_msg, max_size=MAX_SEND_BYTES):
     """Handle large file sending with progress"""
+    if not file_path.exists():
+        await status_msg.edit_text("❌ Downloaded file not found")
+        return False
+        
     file_size = file_path.stat().st_size
     
     if file_size > max_size:
@@ -261,6 +188,8 @@ async def send_large_file(context, chat_id, file_path, status_msg, max_size=MAX_
         return False
     
     try:
+        await status_msg.edit_text(f"📤 Uploading {file_path.name}...")
+        
         async with aiofiles.open(file_path, 'rb') as f:
             await context.bot.send_document(
                 chat_id=chat_id,
@@ -268,7 +197,8 @@ async def send_large_file(context, chat_id, file_path, status_msg, max_size=MAX_
                 filename=file_path.name,
                 read_timeout=120,
                 write_timeout=120,
-                connect_timeout=120
+                connect_timeout=120,
+                caption=f"🎬 {file_path.stem}"
             )
         return True
     except Exception as e:
@@ -290,7 +220,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /random to fetch a random video\n\n"
         f"💾 Memory: {memory.percent}% used\n"
         f"💿 Disk: {disk.percent}% used\n"
-        f"📁 Temp: {get_download_dir()}"
+        f"📁 Temp: {get_download_dir()}\n"
+        f"🔌 Hanime Plugin: {'✅ Available' if HANIME_PLUGIN_AVAILABLE else '❌ Not Available'}"
     )
     
     await update.message.reply_text(message)
@@ -303,31 +234,39 @@ async def random_hanime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("🔎 Fetching random video...")
 
     try:
-        # Initialize extractor
-        extractor = HanimeExtractor()
+        downloader = HanimeDownloader()
         
         # Step 1: Get random video URL
-        await status_msg.edit_text("🎲 Getting random video...")
-        video_url = extractor.get_random_video_url()
+        await status_msg.edit_text("🎲 Getting random video page...")
+        video_url = downloader.get_random_video_page()
         
-        # Step 2: Extract video data
-        await status_msg.edit_text("🔍 Extracting video information...")
-        video_data = extractor.extract_video_data(video_url)
-        
-        # Step 3: Get the best video URL
-        best_url = extractor.get_best_video_url(video_data)
-        
-        await status_msg.edit_text(
-            f"📹 Found: {video_data['title']}\n"
-            f"🔗 URLs found: {len(video_data['video_urls'])}\n"
-            f"⬇️ Starting download..."
-        )
+        logger.info(f"Random video URL: {video_url}")
+        await status_msg.edit_text(f"🔗 Found: {video_url}")
 
-        # Step 4: Download with yt-dlp
-        progress_state = {"percent": 0, "downloaded_mb": 0, "total_mb": 0, "speed": 0}
+        # Step 2: Get video info
+        await status_msg.edit_text("📋 Getting video information...")
+        try:
+            video_info = downloader.get_video_info(video_url)
+            title = video_info.get('title', 'Unknown Title')
+            duration = video_info.get('duration', 0)
+            
+            duration_text = f"{duration//60}:{duration%60:02d}" if duration else "Unknown"
+            await status_msg.edit_text(f"🎬 {title}\n⏱️ Duration: {duration_text}\n⬇️ Starting download...")
+        except Exception as e:
+            logger.warning(f"Couldn't get video info: {e}")
+            await status_msg.edit_text(f"🎬 Starting download...\n⚠️ Couldn't get video info: {e}")
+
+        # Step 3: Download video
+        progress_state = {
+            "percent": 0, 
+            "downloaded_mb": 0, 
+            "total_mb": 0, 
+            "speed": 0,
+            "eta": 0
+        }
         
         def run_download():
-            return yt_dlp_download_blocking(best_url, get_download_dir(), progress_state)
+            return downloader.download_video(video_url, get_download_dir(), progress_state)
 
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(None, run_download)
@@ -337,18 +276,22 @@ async def random_hanime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_percent = -1
         
         while not future.done():
+            await asyncio.sleep(2)
             current_time = time.time()
             pct = progress_state.get("percent", 0)
             downloaded_mb = progress_state.get("downloaded_mb", 0)
             total_mb = progress_state.get("total_mb", 0)
             speed = progress_state.get("speed", 0)
+            eta = progress_state.get("eta", 0)
             
-            # Update every 3 seconds or when percentage changes significantly
-            if current_time - last_update >= 3 or abs(pct - last_percent) >= 5:
-                speed_text = f" | {speed/1024/1024:.1f} MB/s" if speed else ""
+            # Update every 5 seconds or when percentage changes significantly
+            if current_time - last_update >= 5 or abs(pct - last_percent) >= 10:
+                speed_text = f" | 🚀 {speed/1024/1024:.1f}MB/s" if speed else ""
+                eta_text = f" | ⏳ {eta}s" if eta else ""
                 progress_text = (
                     f"⬇️ Downloading: {pct}%\n"
-                    f"📊 {downloaded_mb:.1f}MB / {total_mb:.1f}MB{speed_text}"
+                    f"📊 {downloaded_mb:.1f}MB / {total_mb:.1f}MB"
+                    f"{speed_text}{eta_text}"
                 )
                 
                 try:
@@ -357,16 +300,23 @@ async def random_hanime(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     last_percent = pct
                 except Exception as e:
                     logger.warning(f"Failed to update progress: {e}")
-            
-            await asyncio.sleep(1)
 
-        # Step 5: Get the downloaded file
+        # Step 4: Get the downloaded file
         path = await future
+        if not path or not path.exists():
+            await status_msg.edit_text("❌ Download failed - no file found")
+            return
+
         file_size = path.stat().st_size
         
-        await status_msg.edit_text(f"✅ Download complete!\n📦 File: {path.name}\n💾 Size: {file_size/1024/1024:.2f}MB\n📤 Uploading...")
+        await status_msg.edit_text(
+            f"✅ Download complete!\n"
+            f"📦 File: {path.name}\n"
+            f"💾 Size: {file_size/1024/1024:.2f}MB\n"
+            f"📤 Uploading..."
+        )
 
-        # Step 6: Send the file
+        # Step 5: Send the file
         success = await send_large_file(context, CHAT_ID, path, status_msg)
         
         if success:
@@ -390,11 +340,17 @@ async def random_hanime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(error_msg)
 
 def main():
+    # Check plugin status
+    if not HANIME_PLUGIN_AVAILABLE:
+        logger.warning("Hanime TV plugin not available - some features may not work")
+    
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("random", random_hanime))
     
-    logger.info("Bot started with enhanced hanime.tv support!")
+    logger.info("Bot started!")
+    logger.info(f"Hanime plugin: {'Available' if HANIME_PLUGIN_AVAILABLE else 'Not available'}")
+    
     app.run_polling()
 
 if __name__ == "__main__":
