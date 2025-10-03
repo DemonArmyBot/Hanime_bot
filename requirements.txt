@@ -1,0 +1,17 @@
+python-telegram-bot
+yt-dlp
+requests
+beautifulsoup4
+tqdm
+Flask
+gunicorn
+telebot
+cloudscraper
+tenacity
+Pillow
+psutil
+pycryptodomex
+aiofiles
+tgcrypto
+playwright
+git+https://github.com/cynthia2006/hanime-tv-plugin.git
