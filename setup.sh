@@ -1,13 +1,27 @@
 #!/bin/bash
-echo "Installing Hanime Bot..."
+set -e  # Exit on any error
 
-# Install Python dependencies
-pip install -r requirements.txt
+echo "🚀 Starting Hanime Bot Setup..."
 
-# Install Playwright browser
+# Check if we're in the right directory
+if [ ! -f "requirements.txt" ]; then
+    echo "❌ requirements.txt not found. Please run this script from the project root."
+    exit 1
+fi
+
+echo "📦 Installing Python dependencies..."
+pip install --no-cache-dir -r requirements.txt
+
+echo "🌐 Installing Playwright browser..."
 playwright install chromium
 
-# Try to install hanime plugin
+echo "🔌 Installing Hanime TV plugin..."
 python install_plugins.py
 
-echo "Setup complete!"
+echo "✅ Setup completed successfully!"
+echo ""
+echo "📝 Available commands:"
+echo "   python bot.py          - Start the bot"
+echo "   gunicorn web:app       - Start the web server"
+echo ""
+echo "🎉 Your Hanime Bot is ready to use!"
